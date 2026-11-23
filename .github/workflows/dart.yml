@@ -1,3 +1,4 @@
+
 name: iOS-ipa-build
 
 on:
@@ -8,35 +9,79 @@ jobs:
     name: 🎉 iOS Build
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
-          architecture: x64
+
       - run: flutter pub get
-      
+
+      - name: Update lucide_icons
+        run: flutter pub upgrade lucide_icons
+
+      - name: Configure unsigned build in Xcode project
+        run: |
+          python3 - << 'EOF'
+          from pathlib import Path
+          import re
+
+          pbxproj = Path("ios/Runner.xcodeproj/project.pbxproj")
+          content = pbxproj.read_text(encoding="utf-8")
+
+          content = re.sub(r'CODE_SIGN_STYLE\s*=\s*Automatic;', 'CODE_SIGN_STYLE = Manual;', content)
+          content = re.sub(r'DEVELOPMENT_TEAM\s*=\s*"";', 'DEVELOPMENT_TEAM = "0000000000";', content)
+
+          def inject_team(match):
+              block = match.group(0)
+              if "DEVELOPMENT_TEAM" not in block:
+                  block = block.replace(
+                      "PRODUCT_BUNDLE_IDENTIFIER",
+                      'DEVELOPMENT_TEAM = "0000000000";\n\t\t\t\tCODE_SIGN_STYLE = Manual;\n\t\t\t\tPRODUCT_BUNDLE_IDENTIFIER'
+                  )
+              return block
+
+          content = re.sub(r'buildSettings\s*=\s*\{.*?\};', inject_team, content, flags=re.DOTALL)
+          pbxproj.write_text(content, encoding="utf-8")
+          EOF
 
       - run: pod repo update
         working-directory: ios
 
-      - run: flutter build ios --release --no-codesign
+      - name: Build iOS (unsigned)
+        run: |
+          flutter build ios --release --no-codesign || \
+          xcodebuild -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/ios_derived \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
 
-      - run: mkdir Payload
-        working-directory: build/ios/iphoneos
+      - name: Package IPA
+        run: |
+          APP_PATH=""
+          if [ -d "build/ios/iphoneos/Runner.app" ]; then
+            APP_PATH="build/ios/iphoneos/Runner.app"
+          elif [ -d "build/ios_derived/Build/Products/Release-iphoneos/Runner.app" ]; then
+            APP_PATH="build/ios_derived/Build/Products/Release-iphoneos/Runner.app"
+          else
+            echo "No se encontró Runner.app"
+            exit 1
+          fi
 
-      - run: mv Runner.app/ Payload
-        working-directory: build/ios/iphoneos
-
-      - name: Zip output
-        run: zip -qq -r -9 FlutterIpaExport.ipa Payload
-        working-directory: build/ios/iphoneos
+          mkdir -p build/ipa_pkg/Payload
+          cp -R "$APP_PATH" build/ipa_pkg/Payload/
+          cd build/ipa_pkg
+          zip -qq -r -9 FlutterIpaExport.ipa Payload
 
       - name: Upload binaries to release
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: build/ios/iphoneos/FlutterIpaExport.ipa
+          file: build/ipa_pkg/FlutterIpaExport.ipa
           tag: v1.0
           overwrite: true
           body: "This is first release"
